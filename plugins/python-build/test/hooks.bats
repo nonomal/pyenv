@@ -17,6 +17,8 @@ OUT
   stub pyenv-rehash "echo rehashed"
 
   definition="${TMP}/3.6.2"
+  stub pyenv-latest "echo $definition"
+
   cat > "$definition" <<<"echo python-build"
   run pyenv-install "$definition"
 
