@@ -11,15 +11,18 @@ Also ignores sub-patch releases if that major.minor.patch already exists,
 but otherwise, takes the latest sub-patch release for given OS/arch.
 Assumes all miniconda3 releases < 4.7 default to python 3.6, and anything else 3.7.
 """
+import logging
+import re
+import string
+import sys
 import textwrap
 from argparse import ArgumentParser
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from functools import total_ordering
 from pathlib import Path
 from typing import NamedTuple, List, Optional, DefaultDict, Dict
-import logging
-import string
 
 import requests_html
 
@@ -90,7 +93,7 @@ class Flavor(StrEnum):
     ANACONDA = "anaconda"
     MINICONDA = "miniconda"
 
-    
+
 class TFlavor(StrEnum):
     ANACONDA = "Anaconda"
     MINICONDA = "Miniconda"
@@ -102,25 +105,43 @@ class Suffix(StrEnum):
     NONE = ""
 
 
-class PyVersion(StrEnum):
-    PY27 = "py27"
-    PY36 = "py36"
-    PY37 = "py37"
-    PY38 = "py38"
-    PY39 = "py39"
+PyVersion = None
+class PyVersionMeta(type):
+    def __getattr__(self, name):
+        """Generate PyVersion.PYXXX on demand to future-proof it"""
+        if PyVersion is not None:
+            return PyVersion(name.lower())
+        return super(PyVersionMeta,self).__getattr__(self, name)
+
+
+@dataclass(frozen=True)
+class PyVersion(metaclass=PyVersionMeta):
+    major: str
+    minor: str
+
+    def __init__(self, value):
+        (major, minor) = re.match(r"py(\d)(\d+)", value).groups()
+        object.__setattr__(self, "major", major)
+        object.__setattr__(self, "minor", minor)
+
+    @property
+    def value(self):
+        return f"py{self.major}{self.minor}"
 
     def version(self):
-        first, *others = self.value[2:]
-        return f"{first}.{''.join(others)}"
+        return f"{self.major}.{self.minor}"
 
     def version_info(self):
-        return tuple(int(n) for n in self.version().split("."))
+        return (self.major, self.minor)
+
+    def __str__(self):
+        return self.value
 
 
 @total_ordering
 class VersionStr(str):
     def info(self):
-        return tuple(int(n) for n in self.split("."))
+        return tuple(int(n) for n in self.replace("-", ".").split("."))
 
     def __eq__(self, other):
         return str(self) == str(other)
@@ -149,20 +170,23 @@ class CondaVersion(NamedTuple):
         """
         Convert a string of the form "miniconda_n-ver" or "miniconda_n-py_ver-ver" to a :class:`CondaVersion` object.
         """
-        components = s.split("-")
-        if len(components) == 3:
-            miniconda_n, py_ver, ver = components
-            py_ver = PyVersion(f"py{py_ver.replace('.', '')}")
-        else:
-            miniconda_n, ver = components
-            py_ver = None
-
+        miniconda_n, _, remainder = s.partition("-")
         suffix = miniconda_n[-1]
         if suffix in string.digits:
             flavor = miniconda_n[:-1]
         else:
             flavor = miniconda_n
             suffix = ""
+
+        components = remainder.split("-")
+        if flavor == Flavor.MINICONDA and len(components) >= 2:
+            py_ver, *ver_parts = components
+            py_ver = PyVersion(f"py{py_ver.replace('.', '')}")
+            ver = "-".join(ver_parts)
+        else:
+            ver = "-".join(components)
+            py_ver = None
+
         return CondaVersion(Flavor(flavor), Suffix(suffix), VersionStr(ver), py_ver)
 
     def to_filename(self):
@@ -185,10 +209,19 @@ class CondaVersion(NamedTuple):
             # https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-python.html
             if v < (4, 7):
                 return PyVersion.PY36
-            else:
+            if v < (4, 8):
                 return PyVersion.PY37
+            else:
+                # since 4.8, Miniconda specifies versions explicitly in the file name
+                raise ValueError("Miniconda 4.8+ is supposed to specify a Python version explicitly")
         if self.flavor == "anaconda":
-            # https://docs.anaconda.com/anaconda/reference/release-notes/
+            # https://docs.anaconda.com/free/anaconda/reference/release-notes/
+            if v >= (2024,6):
+                return PyVersion.PY312
+            if v >= (2023,7):
+                return PyVersion.PY311
+            if v >= (2023,3):
+                return PyVersion.PY310
             if v >= (2021,11):
                 return PyVersion.PY39
             if v >= (2020,7):
@@ -199,7 +232,7 @@ class CondaVersion(NamedTuple):
                 return PyVersion.PY37
             return PyVersion.PY36
 
-        raise ValueError(flavor)
+        raise ValueError(self.flavor)
 
 
 class CondaSpec(NamedTuple):
@@ -213,7 +246,10 @@ class CondaSpec(NamedTuple):
 
     @classmethod
     def from_filestem(cls, stem, md5, repo, py_version=None):
-        miniconda_n, ver, os, arch = stem.split("-")
+        # The `*vers` captures the new trailing `-1` in some file names (a build number?)
+        # so they can be processed properly.
+        miniconda_n, *vers, os, arch = stem.split("-")
+        ver = "-".join(vers)
         suffix = miniconda_n[-1]
         if suffix in string.digits:
             tflavor = miniconda_n[:-1]
@@ -234,8 +270,9 @@ class CondaSpec(NamedTuple):
             SupportedArch(arch),
             md5,
             repo,
+            py_ver
         )
-        if py_version is None:
+        if py_version is None and py_ver is None and ver != "latest":
             spec = spec.with_py_version(spec.version.default_py_version())
         return spec
 
@@ -284,8 +321,8 @@ def get_existing_condas(name):
             if v.version_str != "latest":
                 logger.debug("Found existing %(name)s version %(v)s", locals())
                 yield v
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.error("Unable to parse existing version %s: %s", entry_name, e)
 
 
 def get_available_condas(name, repo):
@@ -336,19 +373,12 @@ if __name__ == "__main__":
         help="Do not write scripts, just report them to stdout",
     )
     parser.add_argument(
-        "-v", "--verbose", action="count", default=0,
+        "-v", "--verbose", action="store_true", default=0,
         help="Increase verbosity of logging",
     )
     parsed = parser.parse_args()
 
-    log_level = {
-        0: logging.WARNING,
-        1: logging.INFO,
-        2: logging.DEBUG,
-    }.get(parsed.verbose, logging.DEBUG)
-    logging.basicConfig(level=log_level)
-    if parsed.verbose < 3:
-        logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.basicConfig(level=logging.DEBUG if parsed.verbose else logging.INFO)
 
     existing_versions = set()
     available_specs = set()
@@ -365,15 +395,15 @@ if __name__ == "__main__":
     for s in sorted(available_specs, key=key_fn):
         key = s.version
         vv = key.version_str.info()
-        
+
         reason = None
         if key in existing_versions:
             reason = "already exists"
         elif key.version_str.info() <= (4, 3, 30):
             reason = "too old"
-        elif len(key.version_str.info()) >= 4:
+        elif len(key.version_str.info()) >= 4 and "-" not in key.version_str:
             reason = "ignoring hotfix releases"
-        
+
         if reason:
             logger.debug("Ignoring version %(s)s (%(reason)s)", locals())
             continue
